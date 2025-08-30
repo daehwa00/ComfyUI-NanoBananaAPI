@@ -10,7 +10,7 @@ Dependencies are listed in `requirements.txt`.
 
 1. Clone or download this repository:
    ```powershell
-   git clone https://github.com/yourusername/ComfyUI-NanoBananaAPI.git
+   git clone https://github.com/daehwa00/ComfyUI-NanoBananaAPI.git
    cd ComfyUI-NanoBananaAPI
    ```
 2. Install dependencies:
