@@ -1,5 +1,3 @@
-# gemini_image_edit_node_channel_last.py
-# requirements: google-genai (or google.genai), pillow, numpy, torch
 from nodes import IO
 import traceback
 from io import BytesIO
@@ -7,15 +5,20 @@ from PIL import Image
 import numpy as np
 import torch
 
-# defensive import
+# Try import genai from the two common namespaces
+genai = None
 try:
-    from google import genai
+    # preferred official package namespace
+    from google import genai as _genai
+    from google.genai.types import GenerateContentConfig, Modality, Part
+    genai = _genai
 except Exception:
     try:
-        import genai
+        import genai as _genai
+        from genai.types import GenerateContentConfig, Modality, Part
+        genai = _genai
     except Exception:
         genai = None
-
 
 class GeminiImageEditNode:
     @classmethod
@@ -48,11 +51,7 @@ class GeminiImageEditNode:
             if img.ndim == 4 and img.shape[0] == 1:
                 img = img.squeeze(0)
             # channel-first (C,H,W) -> (H,W,C)
-            if (
-                img.ndim == 3
-                and img.shape[0] in (1, 3, 4)
-                and img.shape[0] < img.shape[1]
-            ):
+            if img.ndim == 3 and img.shape[0] in (1, 3, 4) and img.shape[0] < img.shape[1]:
                 img = img.permute(1, 2, 0)
             arr = img.numpy()
             # floats in [0..1] -> scale to 0..255
@@ -71,11 +70,7 @@ class GeminiImageEditNode:
         if isinstance(image, np.ndarray):
             arr = image
             # channel-first heuristic
-            if (
-                arr.ndim == 3
-                and arr.shape[0] in (1, 3, 4)
-                and arr.shape[0] < arr.shape[1]
-            ):
+            if arr.ndim == 3 and arr.shape[0] in (1, 3, 4) and arr.shape[0] < arr.shape[1]:
                 arr = np.transpose(arr, (1, 2, 0))
             if arr.dtype in (np.float32, np.float64) and arr.max() <= 1.0:
                 arr = (arr * 255).clip(0, 255).astype(np.uint8)
@@ -96,19 +91,14 @@ class GeminiImageEditNode:
     def _pil_to_tensor_channel_last(self, pil_img):
         """
         Convert PIL.Image -> torch.Tensor (1, H, W, 3), float32 in [0,1].
-        This matches your comment: "결과 이미지를 tensor로 변환 (범위 [0,1], 배치 차원 추가)".
         """
         arr = np.array(pil_img.convert("RGB")).astype(np.float32) / 255.0  # H,W,3
         tensor = torch.from_numpy(arr).unsqueeze(0)  # 1,H,W,3
         return tensor
 
-    def generate(
-        self, image, prompt, model_name="gemini-2.5-flash-image-preview", api_key=""
-    ):
+    def generate(self, image, prompt, model_name="gemini-2.5-flash-image-preview", api_key=""):
         if genai is None:
-            raise RuntimeError(
-                "google.genai (or genai) library not found. Install google-genai."
-            )
+            raise RuntimeError("google.genai (or google.genai) library not found. Install google-genai.")
 
         # convert input to PIL image
         try:
@@ -116,17 +106,33 @@ class GeminiImageEditNode:
         except Exception as e:
             raise RuntimeError(f"Failed to convert input image to PIL: {e}")
 
+        # serialize PIL image -> PNG bytes
+        try:
+            buf = BytesIO()
+            pil_image.save(buf, format="PNG")
+            image_bytes = buf.getvalue()
+        except Exception as e:
+            raise RuntimeError(f"Failed to serialize PIL image to bytes: {e}")
+
         # init client (use env var if api_key empty)
         try:
             client = genai.Client(api_key=api_key) if api_key else genai.Client()
         except Exception as e:
             raise RuntimeError(f"Failed to create genai.Client: {e}")
 
-        # call model (NO timeout argument)
+        # prepare contents: plain text prompt + Part.from_bytes(image)
+        try:
+            image_part = Part.from_bytes(data=image_bytes, mime_type="image/png")
+        except Exception as e:
+            tb = traceback.format_exc()
+            raise RuntimeError(f"Failed to create image Part for request. Ensure SDK exposes Part.from_bytes.\n{e}\n{tb}")
+
+        # call model and request IMAGE response modality
         try:
             response = client.models.generate_content(
                 model=model_name,
-                contents=[prompt, pil_image],
+                contents=[ prompt, image_part ],
+                config=GenerateContentConfig(response_modalities=[Modality.IMAGE]),
             )
         except Exception as e:
             tb = traceback.format_exc()
@@ -144,7 +150,11 @@ class GeminiImageEditNode:
                     for part in parts:
                         inline = getattr(part, "inline_data", None)
                         if inline is not None and getattr(inline, "data", None):
-                            img_bytes = bytes(inline.data)
+                            data_field = inline.data
+                            if isinstance(data_field, (bytes, bytearray)):
+                                img_bytes = bytes(data_field)
+                            else:
+                                img_bytes = bytes(list(data_field))
                             break
                     if img_bytes:
                         break
@@ -152,7 +162,31 @@ class GeminiImageEditNode:
             img_bytes = None
 
         if img_bytes is None:
-            raise RuntimeError("No image data found in model response.")
+            # no fallback: raise with helpful info if text part exists
+            text_preview = None
+            try:
+                textual_parts = []
+                if getattr(response, "candidates", None):
+                    for cand in response.candidates:
+                        content = getattr(cand, "content", None)
+                        if not content:
+                            continue
+                        for part in getattr(content, "parts", []) or []:
+                            t = getattr(part, "text", None)
+                            if t:
+                                textual_parts.append(t)
+                if textual_parts:
+                    text_preview = "\n".join(textual_parts[:3])
+            except Exception:
+                text_preview = None
+
+            msg = "No image data found in model response."
+            if text_preview:
+                snippet = text_preview.strip()
+                if len(snippet) > 800:
+                    snippet = snippet[:800] + "..."
+                msg += f" Model returned text instead:\n{snippet}"
+            raise RuntimeError(msg)
 
         # open PIL image from bytes
         try:
